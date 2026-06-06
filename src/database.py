@@ -101,6 +101,9 @@ def init_db(db_path: str | None = None) -> None:
     # Migrations: add columns introduced after initial schema
     migrations = [
         "ALTER TABLE skill_gaps ADD COLUMN tech_stack TEXT",
+        "ALTER TABLE resume_profile ADD COLUMN telegram_user_id TEXT",
+        "ALTER TABLE resume_profile ADD COLUMN telegram_chat_id TEXT",
+        "ALTER TABLE digest_history ADD COLUMN telegram_user_id TEXT",
     ]
     for sql in migrations:
         try:

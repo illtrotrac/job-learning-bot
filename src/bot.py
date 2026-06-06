@@ -9,7 +9,7 @@ import json
 import os
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -80,6 +80,18 @@ def send_message(text: str, parse_mode: str = ParseMode.HTML) -> None:
     asyncio.run(_send_async(text, parse_mode))
 
 
+async def _send_to_async(chat_id: str, text: str, parse_mode: str) -> None:
+    from telegram import Bot
+    async with Bot(token=_get_token()) as bot:
+        for chunk in _chunk(text):
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
+
+
+def send_message_to(chat_id: str, text: str, parse_mode: str = ParseMode.HTML) -> None:
+    """Send a message to a specific chat ID (used by digest.py for multi-user sends)."""
+    asyncio.run(_send_to_async(chat_id, text, parse_mode))
+
+
 # ── Chat ID discovery ─────────────────────────────────────────────────────────
 
 async def _get_updates_async() -> list:
@@ -121,34 +133,76 @@ def get_chat_id() -> None:
 
 # ── Profile helper ────────────────────────────────────────────────────────────
 
-def _save_profile(title: str, description: str) -> None:
+def _save_profile(title: str, description: str, user_id: str, chat_id: str) -> None:
     """Save a manual profile to the DB (no API call)."""
     from parser import save_manual_profile
-    save_manual_profile(title, description)
+    save_manual_profile(title, description, telegram_user_id=user_id, telegram_chat_id=chat_id)
 
 
 # ── Interactive command handlers ──────────────────────────────────────────────
 
 HELP_TEXT = (
-    "<b>Job Learning Bot</b>\n\n"
-    "I track job market skill gaps and send daily learning digests.\n\n"
     "<b>Commands:</b>\n"
     "/setjob  — set your target job title and skills\n"
     "/run     — scrape jobs, analyze gaps, find resources\n"
     "/digest  — send today's learning digest\n"
     "/trends  — show trending tech stack across scraped jobs\n"
     "/status  — show current profile and database stats\n"
-    "/cancel  — cancel current operation\n\n"
-    "<i>Tip: start with /setjob, then /run, then /digest.</i>"
+    "/help    — show this message\n"
+    "/cancel  — cancel current operation"
+)
+
+WELCOME_TEXT = (
+    "<b>Welcome to Job Learning Bot!</b>\n\n"
+    "I track job market skill gaps for your target role and send you "
+    "a daily digest of learning resources — straight to Telegram.\n\n"
+    "<b>Get started in 3 steps:</b>\n"
+    "1. /setjob — tell me what role you're targeting\n"
+    "2. /run — scrape jobs and analyze skill gaps\n"
+    "3. /digest — receive today's learning digest\n\n"
+    + HELP_TEXT
 )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+    """Greet new users; show a shorter help reminder for returning users."""
+    from database import get_connection
+    conn = get_connection()
+    has_profile = conn.execute(
+        "SELECT COUNT(*) AS n FROM resume_profile WHERE is_active = 1"
+    ).fetchone()["n"] > 0
+    conn.close()
+
+    if has_profile:
+        # Returning user — skip the long intro
+        await update.message.reply_text(
+            "Welcome back!\n\n" + HELP_TEXT + "\n\nTap / to see all commands.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        # First time — full onboarding welcome
+        await update.message.reply_text(WELCOME_TEXT, parse_mode=ParseMode.HTML)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Respond to any non-command message with a helpful nudge."""
+    await update.message.reply_text(
+        "I only understand commands. Tap / or choose one below:\n\n"
+        + HELP_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch unrecognised commands like /stat or /jobs."""
+    await update.message.reply_text(
+        f"Unknown command. Here's what I support:\n\n" + HELP_TEXT,
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # /setjob conversation ─────────────────────────────────────────────────────────
@@ -182,13 +236,15 @@ async def received_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def received_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     description = update.message.text.strip()
     title = context.user_data.get("job_title", "")
-    _save_profile(title, description)
+    user_id = str(update.effective_user.id)
+    chat_id = str(update.effective_chat.id)
+    _save_profile(title, description, user_id, chat_id)
 
     await update.message.reply_text(
         f"Profile saved.\n\n"
         f"<b>Title:</b> {title}\n"
         f"<b>Skills:</b> {description}\n\n"
-        "Ready to go. Run /run to scrape jobs and analyze skill gaps.",
+        "Ready to go. Send /run to scrape jobs and analyze skill gaps.",
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
@@ -196,11 +252,13 @@ async def received_description(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def skip_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     title = context.user_data.get("job_title", "")
-    _save_profile(title, "")
+    user_id = str(update.effective_user.id)
+    chat_id = str(update.effective_chat.id)
+    _save_profile(title, "", user_id, chat_id)
 
     await update.message.reply_text(
         f"Profile saved with title: <b>{title}</b>\n\n"
-        "Run /run to scrape jobs and analyze skill gaps.",
+        "Send /run to scrape jobs and analyze skill gaps.",
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
@@ -221,6 +279,8 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
     )
 
+    user_id = str(update.effective_user.id)
+
     try:
         from scraper import scrape_jobs
         new_jobs = await loop.run_in_executor(None, scrape_jobs)
@@ -230,7 +290,9 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         from analyzer import analyze_jobs
-        analyzed = await loop.run_in_executor(None, analyze_jobs)
+        analyzed = await loop.run_in_executor(
+            None, lambda: analyze_jobs(telegram_user_id=user_id)
+        )
         await update.message.reply_text(
             f"<i>Step 2/3 done — {analyzed} job(s) analyzed.\nStep 3/3: Finding learning resources</i>",
             parse_mode=ParseMode.HTML,
@@ -267,14 +329,19 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # /digest ──────────────────────────────────────────────────────────────────────
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Building digest...")
+    await update.message.reply_text("Building your digest...")
     loop = asyncio.get_event_loop()
+    user_id = str(update.effective_user.id)
+    chat_id = str(update.effective_chat.id)
     try:
         from digest import send_digest
-        sent = await loop.run_in_executor(None, lambda: send_digest(force=True))
+        sent = await loop.run_in_executor(
+            None,
+            lambda: send_digest(telegram_user_id=user_id, chat_id=chat_id, force=True),
+        )
         if not sent:
             await update.message.reply_text(
-                "Nothing to send yet. Run /run first to scrape jobs and find resources."
+                "Nothing to send yet. Send /run first to scrape jobs and find resources."
             )
     except Exception as e:
         await update.message.reply_text(f"Error sending digest: {e}")
@@ -284,15 +351,21 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from database import get_connection
+    user_id = str(update.effective_user.id)
     conn = get_connection()
     rows = conn.execute(
-        "SELECT tech_stack FROM skill_gaps WHERE tech_stack IS NOT NULL"
+        """
+        SELECT g.tech_stack FROM skill_gaps g
+        JOIN resume_profile p ON p.id = g.resume_profile_id
+        WHERE g.tech_stack IS NOT NULL AND p.telegram_user_id = ?
+        """,
+        (user_id,),
     ).fetchall()
     conn.close()
 
     if not rows:
         await update.message.reply_text(
-            "No trend data yet. Run /run first to analyze jobs."
+            "No trend data for your profile yet. Send /run first to analyze jobs."
         )
         return
 
@@ -305,7 +378,6 @@ async def cmd_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 counts[key] = counts.get(key, 0) + 1
 
     ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:15]
-
     lines = [f"<b>Trending Tech Stack</b> <i>(from {total} analyzed jobs)</i>\n"]
     for tool, count in ranked:
         pct = count / total * 100
@@ -320,18 +392,24 @@ async def cmd_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from database import get_connection
+    user_id = str(update.effective_user.id)
     conn = get_connection()
 
     profile_row = conn.execute(
-        "SELECT profile_json FROM resume_profile WHERE is_active = 1 LIMIT 1"
+        "SELECT profile_json FROM resume_profile WHERE is_active = 1 AND telegram_user_id = ? LIMIT 1",
+        (user_id,),
     ).fetchone()
 
     jobs_total = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
-    jobs_analyzed = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE is_analyzed = 1").fetchone()["n"]
-    gaps_total = conn.execute("SELECT COUNT(*) AS n FROM skill_gaps").fetchone()["n"]
+    gaps_total = conn.execute(
+        "SELECT COUNT(*) AS n FROM skill_gaps g "
+        "JOIN resume_profile p ON p.id = g.resume_profile_id WHERE p.telegram_user_id = ?",
+        (user_id,),
+    ).fetchone()["n"]
     resources_total = conn.execute("SELECT COUNT(*) AS n FROM learning_resources").fetchone()["n"]
     last_digest = conn.execute(
-        "SELECT sent_at FROM digest_history ORDER BY sent_at DESC LIMIT 1"
+        "SELECT sent_at FROM digest_history WHERE telegram_user_id = ? ORDER BY sent_at DESC LIMIT 1",
+        (user_id,),
     ).fetchone()
     conn.close()
 
@@ -347,12 +425,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     digest_str = last_digest["sent_at"] if last_digest else "Never"
 
     await update.message.reply_text(
-        f"<b>Bot Status</b>\n\n"
+        f"<b>Your Status</b>\n\n"
         f"<b>Active Profile:</b>\n{profile_str}\n\n"
-        f"<b>Database:</b>\n"
-        f"  Jobs scraped : {jobs_total} ({jobs_analyzed} analyzed)\n"
-        f"  Skill gaps   : {gaps_total}\n"
-        f"  Resources    : {resources_total}\n\n"
+        f"<b>Your Stats:</b>\n"
+        f"  Jobs in database  : {jobs_total}\n"
+        f"  Your skill gaps   : {gaps_total}\n"
+        f"  Learning resources: {resources_total}\n\n"
         f"<b>Last digest sent:</b> {digest_str}",
         parse_mode=ParseMode.HTML,
     )
@@ -360,13 +438,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── Bot startup ───────────────────────────────────────────────────────────────
 
+async def _post_init(app: Application) -> None:
+    """Register commands in Telegram's native '/' menu on startup."""
+    await app.bot.set_my_commands([
+        BotCommand("setjob",  "Set your target job title and skills"),
+        BotCommand("run",     "Scrape jobs, analyze gaps, find resources"),
+        BotCommand("digest",  "Send today's learning digest"),
+        BotCommand("trends",  "Show trending tech stack"),
+        BotCommand("status",  "Show current profile and stats"),
+        BotCommand("help",    "Show all commands"),
+    ])
+
+
 def run_bot() -> None:
     """Start the interactive Telegram bot (blocking)."""
     token = _get_token()
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
 
-    # /setjob conversation
+    # /setjob multi-step conversation
     setjob_handler = ConversationHandler(
         entry_points=[CommandHandler("setjob", cmd_setjob)],
         states={
@@ -389,8 +479,12 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("trends", cmd_trends))
     app.add_handler(CommandHandler("status", cmd_status))
 
+    # Catch-all handlers — must be registered LAST
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
+
     print("Bot is running. Press Ctrl+C to stop.")
-    print(f"Open Telegram and message your bot to get started.")
+    print("Open Telegram and message your bot to get started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

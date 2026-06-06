@@ -61,14 +61,22 @@ def hash_content(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def get_active_profile(conn: sqlite3.Connection) -> dict | None:
-    """Return the currently active resume profile, or None."""
-    row = conn.execute(
-        "SELECT * FROM resume_profile WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        return dict(row)
-    return None
+def get_active_profile(
+    conn: sqlite3.Connection,
+    telegram_user_id: str | None = None,
+) -> dict | None:
+    """Return the active resume profile for a user, or the global active one."""
+    if telegram_user_id:
+        row = conn.execute(
+            "SELECT * FROM resume_profile WHERE is_active = 1 AND telegram_user_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (telegram_user_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM resume_profile WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def call_claude_extract(resume_text: str) -> dict:
@@ -104,6 +112,8 @@ def save_manual_profile(
     title: str,
     description: str = "",
     db_path: str | None = None,
+    telegram_user_id: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> dict:
     """
     Save a manually entered job title + description as the active profile.
@@ -150,18 +160,31 @@ def save_manual_profile(
     conn = get_connection(db_path)
 
     raw_text = f"{title}\n{description}".strip()
-    content_hash = hash_content(raw_text)
+    # Include user ID in hash so two users with identical titles don't collide
+    content_hash = hash_content(f"{telegram_user_id or ''}:{raw_text}")
 
-    conn.execute("UPDATE resume_profile SET is_active = 0")
+    # Deactivate only this user's previous profiles
+    if telegram_user_id:
+        conn.execute(
+            "UPDATE resume_profile SET is_active = 0 WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        )
+    else:
+        conn.execute("UPDATE resume_profile SET is_active = 0")
+
     conn.execute(
         """
-        INSERT INTO resume_profile (source_type, source_hash, raw_text, profile_json, is_active)
-        VALUES (?, ?, ?, ?, 1)
+        INSERT INTO resume_profile
+            (source_type, source_hash, raw_text, profile_json, is_active,
+             telegram_user_id, telegram_chat_id)
+        VALUES (?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(source_hash) DO UPDATE SET
             is_active = 1,
-            profile_json = excluded.profile_json
+            profile_json = excluded.profile_json,
+            telegram_chat_id = excluded.telegram_chat_id
         """,
-        ("text", content_hash, raw_text, json.dumps(profile)),
+        ("text", content_hash, raw_text, json.dumps(profile),
+         telegram_user_id, telegram_chat_id),
     )
     conn.commit()
     conn.close()

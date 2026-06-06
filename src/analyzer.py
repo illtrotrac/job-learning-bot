@@ -49,12 +49,33 @@ Rules:
 - summary: one plain sentence, no fluff"""
 
 
-def get_unanalyzed_jobs(conn: sqlite3.Connection, limit: int = 5) -> list[dict]:
-    """Fetch jobs that haven't been analyzed yet."""
-    rows = conn.execute(
-        "SELECT * FROM jobs WHERE is_analyzed = 0 ORDER BY scraped_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+def get_unanalyzed_jobs(
+    conn: sqlite3.Connection,
+    limit: int = 5,
+    telegram_user_id: str | None = None,
+) -> list[dict]:
+    """
+    Fetch jobs not yet analyzed for this user.
+    Each user gets their own analysis even if the same job was analyzed by someone else.
+    """
+    if telegram_user_id:
+        rows = conn.execute(
+            """
+            SELECT j.* FROM jobs j
+            WHERE NOT EXISTS (
+                SELECT 1 FROM skill_gaps g
+                JOIN resume_profile p ON p.id = g.resume_profile_id
+                WHERE g.job_id = j.id AND p.telegram_user_id = ?
+            )
+            ORDER BY j.scraped_at DESC LIMIT ?
+            """,
+            (telegram_user_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE is_analyzed = 0 ORDER BY scraped_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -162,7 +183,11 @@ def list_gaps(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def analyze_jobs(limit: int = 5, db_path: str | None = None) -> int:
+def analyze_jobs(
+    limit: int = 5,
+    db_path: str | None = None,
+    telegram_user_id: str | None = None,
+) -> int:
     """
     Analyze all unanalyzed jobs against the active profile.
 
@@ -176,15 +201,18 @@ def analyze_jobs(limit: int = 5, db_path: str | None = None) -> int:
     init_db(db_path)
     conn = get_connection(db_path)
 
-    profile_row = get_active_profile(conn)
+    profile_row = get_active_profile(conn, telegram_user_id)
     if not profile_row:
         conn.close()
-        raise ValueError("No active profile. Run parser.py first.")
+        raise ValueError(
+            "No active profile found. "
+            + ("Use /setjob to set one." if telegram_user_id else "Run parser.py first.")
+        )
 
     profile = json.loads(profile_row["profile_json"])
     profile_db_id = profile_row["id"]
 
-    jobs = get_unanalyzed_jobs(conn, limit)
+    jobs = get_unanalyzed_jobs(conn, limit, telegram_user_id)
     if not jobs:
         print("No unanalyzed jobs found. Run scraper.py first.")
         conn.close()

@@ -1,6 +1,9 @@
 """
 Daily digest builder: assembles job matches, skill gaps, tech trends, and learning
 resources into a single Telegram message and records each send in digest_history.
+
+Supports multiple users — each user gets a digest based on their own profile.
+Digests are sent on-demand via the /digest bot command.
 """
 
 import json
@@ -10,32 +13,56 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-from bot import send_message
 from database import get_connection, init_db
 
 load_dotenv()
 
 
-# ── Data collectors ───────────────────────────────────────────────────────────
+# ── Data collectors (all filtered by the user's profile IDs) ─────────────────
 
-def _top_job_matches(conn: sqlite3.Connection, limit: int = 5) -> list[dict]:
+def _get_profile_ids(conn: sqlite3.Connection, telegram_user_id: str) -> list[int]:
     rows = conn.execute(
-        """
-        SELECT j.title, j.company, j.location, j.url,
+        "SELECT id FROM resume_profile WHERE telegram_user_id = ? AND is_active = 1",
+        (telegram_user_id,),
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def _top_job_matches(
+    conn: sqlite3.Connection,
+    profile_ids: list[int],
+    limit: int = 5,
+) -> list[dict]:
+    if not profile_ids:
+        return []
+    placeholders = ",".join("?" * len(profile_ids))
+    rows = conn.execute(
+        f"""
+        SELECT j.id, j.title, j.company, j.location, j.url,
                g.match_score, g.missing_skills
         FROM skill_gaps g
         JOIN jobs j ON j.id = g.job_id
+        WHERE g.resume_profile_id IN ({placeholders})
         ORDER BY g.match_score DESC
         LIMIT ?
         """,
-        (limit,),
+        (*profile_ids, limit),
     ).fetchall()
     return [dict(r) for r in rows]
 
 
-def _tech_trends(conn: sqlite3.Connection, top_n: int = 8) -> list[tuple[str, int, int]]:
+def _tech_trends(
+    conn: sqlite3.Connection,
+    profile_ids: list[int],
+    top_n: int = 8,
+) -> list[tuple[str, int, int]]:
+    if not profile_ids:
+        return []
+    placeholders = ",".join("?" * len(profile_ids))
     rows = conn.execute(
-        "SELECT tech_stack FROM skill_gaps WHERE tech_stack IS NOT NULL"
+        f"SELECT tech_stack FROM skill_gaps "
+        f"WHERE tech_stack IS NOT NULL AND resume_profile_id IN ({placeholders})",
+        profile_ids,
     ).fetchall()
     total = len(rows)
     counts: dict[str, int] = {}
@@ -48,9 +75,18 @@ def _tech_trends(conn: sqlite3.Connection, top_n: int = 8) -> list[tuple[str, in
     return [(tool, count, total) for tool, count in ranked[:top_n]]
 
 
-def _top_missing_skills(conn: sqlite3.Connection, top_n: int = 6) -> list[tuple[str, int]]:
+def _top_missing_skills(
+    conn: sqlite3.Connection,
+    profile_ids: list[int],
+    top_n: int = 6,
+) -> list[tuple[str, int]]:
+    if not profile_ids:
+        return []
+    placeholders = ",".join("?" * len(profile_ids))
     rows = conn.execute(
-        "SELECT missing_skills FROM skill_gaps WHERE missing_skills IS NOT NULL"
+        f"SELECT missing_skills FROM skill_gaps "
+        f"WHERE missing_skills IS NOT NULL AND resume_profile_id IN ({placeholders})",
+        profile_ids,
     ).fetchall()
     counts: dict[str, int] = {}
     for row in rows:
@@ -63,7 +99,7 @@ def _top_missing_skills(conn: sqlite3.Connection, top_n: int = 6) -> list[tuple[
 
 
 def _fresh_resources(conn: sqlite3.Connection, limit: int = 4) -> list[dict]:
-    """Prefer least-sent resources so the digest stays fresh each day."""
+    """Learning resources are shared across users; prefer least-sent."""
     rows = conn.execute(
         """
         SELECT * FROM learning_resources
@@ -76,10 +112,11 @@ def _fresh_resources(conn: sqlite3.Connection, limit: int = 4) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def _already_sent_today(conn: sqlite3.Connection) -> bool:
+def _already_sent_today(conn: sqlite3.Connection, telegram_user_id: str) -> bool:
     row = conn.execute(
         "SELECT COUNT(*) AS cnt FROM digest_history "
-        "WHERE date(sent_at) = date('now')"
+        "WHERE date(sent_at) = date('now') AND telegram_user_id = ?",
+        (telegram_user_id,),
     ).fetchone()
     return row["cnt"] > 0
 
@@ -89,25 +126,26 @@ def _record_digest(
     digest_json: dict,
     job_ids: list[int],
     resource_ids: list[int],
-    telegram_message_id: str = "",
+    telegram_user_id: str,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO digest_history (digest_json, jobs_included, resources_included, telegram_message_id)
+        INSERT INTO digest_history
+            (digest_json, jobs_included, resources_included, telegram_user_id)
         VALUES (?, ?, ?, ?)
         """,
         (
             json.dumps(digest_json),
             json.dumps(job_ids),
             json.dumps(resource_ids),
-            telegram_message_id,
+            telegram_user_id,
         ),
     )
-    # Increment sent_count for resources included in this digest
     if resource_ids:
         placeholders = ",".join("?" * len(resource_ids))
         conn.execute(
-            f"UPDATE learning_resources SET sent_count = sent_count + 1 WHERE id IN ({placeholders})",
+            f"UPDATE learning_resources SET sent_count = sent_count + 1 "
+            f"WHERE id IN ({placeholders})",
             resource_ids,
         )
     conn.commit()
@@ -122,48 +160,40 @@ def _bar(count: int, total: int, width: int = 8) -> str:
 
 def format_digest(data: dict) -> str:
     """Format collected digest data as Telegram HTML."""
-    today = datetime.now().strftime("%B %-d, %Y") if os.name != "nt" else datetime.now().strftime("%B %#d, %Y")
+    today = datetime.now().strftime("%B %#d, %Y") if os.name == "nt" else datetime.now().strftime("%B %-d, %Y")
     lines: list[str] = []
 
     lines.append(f"<b>Job Learning Digest — {today}</b>")
 
-    # ── Job matches ──────────────────────────────────────────────────────────
     jobs = data.get("jobs", [])
     if jobs:
         lines.append("")
         lines.append("<b>Top Job Matches</b>")
         for i, job in enumerate(jobs, 1):
             score = job["match_score"]
-            title = job["title"]
-            company = job["company"]
             url = job.get("url", "")
-            location = job.get("location", "")
-            loc_str = f" · {location}" if location else ""
-            link = f'<a href="{url}">{title}</a>' if url else title
-            lines.append(f"{i}. {link} @ {company}{loc_str} — <b>{score:.0%}</b>")
+            loc = f" · {job['location']}" if job.get("location") else ""
+            link = f'<a href="{url}">{job["title"]}</a>' if url else job["title"]
+            lines.append(f"{i}. {link} @ {job['company']}{loc} — <b>{score:.0%}</b>")
     else:
         lines.append("")
-        lines.append("<i>No job matches yet. Run scraper.py and analyzer.py first.</i>")
+        lines.append("<i>No job matches yet. Send /run to start the pipeline.</i>")
 
-    # ── Tech stack trends ────────────────────────────────────────────────────
     trends = data.get("trends", [])
     if trends:
         total_jobs = trends[0][2] if trends else 1
         lines.append("")
-        lines.append(f"<b>Trending Tech Stack</b> <i>(across {total_jobs} jobs)</i>")
+        lines.append(f"<b>Trending Tech Stack</b> <i>({total_jobs} jobs)</i>")
         for tool, count, total in trends:
             pct = count / total * 100 if total else 0
             lines.append(f"  {_bar(count, total)} {tool} — {pct:.0f}%")
 
-    # ── Skill gaps ───────────────────────────────────────────────────────────
     gaps = data.get("missing_skills", [])
     if gaps:
         lines.append("")
         lines.append("<b>Your Top Skill Gaps</b>")
-        gap_strs = [f"{skill} ({count}x)" for skill, count in gaps]
-        lines.append("  " + " · ".join(gap_strs))
+        lines.append("  " + " · ".join(f"{s} ({n}x)" for s, n in gaps))
 
-    # ── Learning resources ───────────────────────────────────────────────────
     resources = data.get("resources", [])
     if resources:
         lines.append("")
@@ -171,102 +201,104 @@ def format_digest(data: dict) -> str:
         for r in resources:
             lines.append("")
             lines.append(f"<b>[{r['skill']}]</b> {r['title']}")
-            lines.append(f'<a href="{r["url"]}">{r["url"][:60]}...</a>' if len(r["url"]) > 60 else f'<a href="{r["url"]}">{r["url"]}</a>')
+            url = r["url"]
+            lines.append(f'<a href="{url}">{url[:60]}{"..." if len(url) > 60 else ""}</a>')
             if r.get("summary"):
                 lines.append(f"<i>{r['summary']}</i>")
     else:
         lines.append("")
-        lines.append("<i>No learning resources yet. Run resources.py first.</i>")
+        lines.append("<i>No resources yet. Send /run to find some.</i>")
 
     lines.append("")
-    lines.append("<i>Job Learning Bot · run daily</i>")
-
+    lines.append("<i>Job Learning Bot · daily digest</i>")
     return "\n".join(lines)
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ── Per-user send ─────────────────────────────────────────────────────────────
 
-def send_digest(db_path: str | None = None, force: bool = False) -> bool:
+def send_digest(
+    telegram_user_id: str,
+    chat_id: str,
+    db_path: str | None = None,
+    force: bool = False,
+) -> bool:
     """
-    Build and send today's digest.
+    Build and send a digest for one user.
 
     Args:
-        db_path: Override DB path.
-        force:   Send even if a digest was already sent today.
-
-    Returns:
-        True if sent, False if skipped.
+        telegram_user_id: The user whose profile and gaps to use.
+        chat_id:          The Telegram chat to send the message to.
+        db_path:          Override DB path.
+        force:            Send even if already sent today.
     """
+    from bot import send_message_to
+
     init_db(db_path)
     conn = get_connection(db_path)
 
-    if not force and _already_sent_today(conn):
-        print("Digest already sent today. Use --force to send again.")
+    if not force and _already_sent_today(conn, telegram_user_id):
+        print(f"[{telegram_user_id}] Digest already sent today, skipping.")
         conn.close()
         return False
 
-    print("Building digest...")
-
-    jobs = _top_job_matches(conn)
-    trends = _tech_trends(conn)
-    missing = _top_missing_skills(conn)
-    resources = _fresh_resources(conn)
-
-    if not jobs and not resources:
-        print(
-            "\nNothing to send yet. Make sure you have run:\n"
-            "  1. python parser.py --job --title 'Your Role'\n"
-            "  2. python scraper.py\n"
-            "  3. python analyzer.py\n"
-            "  4. python resources.py"
-        )
+    profile_ids = _get_profile_ids(conn, telegram_user_id)
+    if not profile_ids:
+        print(f"[{telegram_user_id}] No active profile, skipping.")
         conn.close()
         return False
 
     data = {
-        "jobs": jobs,
-        "trends": trends,
-        "missing_skills": missing,
-        "resources": resources,
+        "jobs": _top_job_matches(conn, profile_ids),
+        "trends": _tech_trends(conn, profile_ids),
+        "missing_skills": _top_missing_skills(conn, profile_ids),
+        "resources": _fresh_resources(conn),
     }
 
-    message = format_digest(data)
-
-    print("\n" + "─" * 60)
-    print(message)
-    print("─" * 60 + "\n")
-
-    print("Sending to Telegram...")
-    try:
-        send_message(message)
-    except Exception as e:
-        print(f"Telegram send failed: {e}")
-        print("Tip: run 'python bot.py --test' to check your bot setup.")
+    if not data["jobs"] and not data["resources"]:
+        print(f"[{telegram_user_id}] Nothing to send yet.")
         conn.close()
         return False
 
-    resource_ids = [r["id"] for r in resources]
-    job_ids = [j.get("id") for j in jobs if j.get("id")]
-    _record_digest(conn, data, job_ids, resource_ids)
+    message = format_digest(data)
+    print(f"[{telegram_user_id}] Sending digest to chat {chat_id}...")
 
+    try:
+        send_message_to(chat_id, message)
+    except Exception as e:
+        print(f"[{telegram_user_id}] Send failed: {e}")
+        conn.close()
+        return False
+
+    resource_ids = [r["id"] for r in data["resources"]]
+    job_ids = [j["id"] for j in data["jobs"] if j.get("id")]
+    _record_digest(conn, data, job_ids, resource_ids, telegram_user_id)
     conn.close()
-    print("Digest sent and recorded.")
+    print(f"[{telegram_user_id}] Done.")
     return True
 
 
-def preview_digest(db_path: str | None = None) -> None:
-    """Print the digest without sending it."""
+def preview_digest(
+    telegram_user_id: str | None = None,
+    db_path: str | None = None,
+) -> None:
+    """Print the digest for a user without sending it."""
     init_db(db_path)
     conn = get_connection(db_path)
 
+    if telegram_user_id:
+        profile_ids = _get_profile_ids(conn, telegram_user_id)
+    else:
+        # Fallback: use all profiles (useful for CLI testing)
+        rows = conn.execute("SELECT id FROM resume_profile WHERE is_active = 1").fetchall()
+        profile_ids = [r["id"] for r in rows]
+
     data = {
-        "jobs": _top_job_matches(conn),
-        "trends": _tech_trends(conn),
-        "missing_skills": _top_missing_skills(conn),
+        "jobs": _top_job_matches(conn, profile_ids),
+        "trends": _tech_trends(conn, profile_ids),
+        "missing_skills": _top_missing_skills(conn, profile_ids),
         "resources": _fresh_resources(conn),
     }
     conn.close()
-
     print(format_digest(data))
 
 
@@ -280,24 +312,10 @@ if __name__ == "__main__":
     if not args:
         print("Usage:")
         print("  python digest.py --preview   # print digest without sending")
-        print("  python digest.py --send      # send to Telegram")
-        print("  python digest.py --force     # send even if already sent today")
-        print()
-        print("Make sure you have completed all prior steps:")
-        print("  python parser.py --job --title 'Your Role'")
-        print("  python scraper.py")
-        print("  python analyzer.py")
-        print("  python resources.py")
         sys.exit(0)
-
-    force = "--force" in args
 
     if "--preview" in args:
         preview_digest()
-    elif "--send" in args or "--force" in args:
-        sent = send_digest(force=force)
-        sys.exit(0 if sent else 1)
     else:
         print(f"Unknown argument: {args[0]}")
-        print("Run 'python digest.py' with no arguments to see usage.")
         sys.exit(1)
