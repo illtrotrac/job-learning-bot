@@ -189,19 +189,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Respond to any non-command message with a helpful nudge."""
+    """Respond to any non-command message with a short nudge."""
     await update.message.reply_text(
-        "I only understand commands. Tap / or choose one below:\n\n"
-        + HELP_TEXT,
-        parse_mode=ParseMode.HTML,
+        "I only respond to commands. Send /help to see what I can do.",
     )
 
 
 async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Catch unrecognised commands like /stat or /jobs."""
+    """Catch unrecognised commands."""
     await update.message.reply_text(
-        f"Unknown command. Here's what I support:\n\n" + HELP_TEXT,
-        parse_mode=ParseMode.HTML,
+        "Unknown command. Send /help to see all available commands.",
     )
 
 
