@@ -481,9 +481,10 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("trends", cmd_trends))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Catch-all handlers in group 1 — only fire if no group 0 handler matched
-    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text), group=1)
+    # Catch-all handlers — same group 0, registered LAST so they only fire
+    # when no earlier handler (including the ConversationHandler) matched.
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
     print("Bot is running. Press Ctrl+C to stop.")
     print("Open Telegram and message your bot to get started.")
