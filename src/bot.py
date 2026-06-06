@@ -9,7 +9,7 @@ import json
 import os
 
 from dotenv import load_dotenv
-from telegram import BotCommand, Update
+from telegram import BotCommand, ForceReply, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -212,6 +212,7 @@ async def cmd_setjob(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "What job title are you targeting?\n\n"
         "<i>Examples: Data Analyst · ML Engineer · Backend Developer · DevOps Engineer</i>",
         parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="e.g. Data Analyst"),
     )
     return WAITING_TITLE
 
@@ -229,6 +230,7 @@ async def received_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "<i>Example: Python, SQL, Tableau, AWS, dbt</i>\n\n"
         "Or send /skip to use just the job title.",
         parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="e.g. Python, SQL, Tableau"),
     )
     return WAITING_DESCRIPTION
 
@@ -479,9 +481,9 @@ def run_bot() -> None:
     app.add_handler(CommandHandler("trends", cmd_trends))
     app.add_handler(CommandHandler("status", cmd_status))
 
-    # Catch-all handlers — must be registered LAST
-    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
+    # Catch-all handlers in group 1 — only fire if no group 0 handler matched
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text), group=1)
 
     print("Bot is running. Press Ctrl+C to stop.")
     print("Open Telegram and message your bot to get started.")
