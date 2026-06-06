@@ -356,7 +356,9 @@ async def cmd_trends(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         """
         SELECT g.tech_stack FROM skill_gaps g
         JOIN resume_profile p ON p.id = g.resume_profile_id
-        WHERE g.tech_stack IS NOT NULL AND p.telegram_user_id = ?
+        WHERE g.tech_stack IS NOT NULL
+          AND p.telegram_user_id = ?
+          AND p.is_active = 1
         """,
         (user_id,),
     ).fetchall()

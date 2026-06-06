@@ -59,13 +59,17 @@ def get_unanalyzed_jobs(
     Each user gets their own analysis even if the same job was analyzed by someone else.
     """
     if telegram_user_id:
+        # Only check the ACTIVE profile — lets the user re-analyze old jobs
+        # after switching roles without re-scraping.
         rows = conn.execute(
             """
             SELECT j.* FROM jobs j
             WHERE NOT EXISTS (
                 SELECT 1 FROM skill_gaps g
                 JOIN resume_profile p ON p.id = g.resume_profile_id
-                WHERE g.job_id = j.id AND p.telegram_user_id = ?
+                WHERE g.job_id = j.id
+                  AND p.telegram_user_id = ?
+                  AND p.is_active = 1
             )
             ORDER BY j.scraped_at DESC LIMIT ?
             """,
