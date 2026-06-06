@@ -32,11 +32,27 @@ Content snippet: <<CONTENT>>
 Return ONLY the 2 sentences, nothing else."""
 
 
-def get_missing_skills(conn: sqlite3.Connection, top_n: int = 5) -> list[str]:
-    """Aggregate missing skills across all analyzed jobs, return top N by frequency."""
-    rows = conn.execute(
-        "SELECT missing_skills FROM skill_gaps WHERE missing_skills IS NOT NULL"
-    ).fetchall()
+def get_missing_skills(
+    conn: sqlite3.Connection,
+    top_n: int = 5,
+    telegram_user_id: str | None = None,
+) -> list[str]:
+    """Aggregate missing skills from the user's active profile gaps, return top N."""
+    if telegram_user_id:
+        rows = conn.execute(
+            """
+            SELECT g.missing_skills FROM skill_gaps g
+            JOIN resume_profile p ON p.id = g.resume_profile_id
+            WHERE g.missing_skills IS NOT NULL
+              AND p.telegram_user_id = ?
+              AND p.is_active = 1
+            """,
+            (telegram_user_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT missing_skills FROM skill_gaps WHERE missing_skills IS NOT NULL"
+        ).fetchall()
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -128,6 +144,7 @@ def fetch_resources(
     skills: list[str] | None = None,
     db_path: str | None = None,
     skip_cache: bool = False,
+    telegram_user_id: str | None = None,
 ) -> int:
     """
     Find and store learning resources for missing skills.
@@ -144,7 +161,7 @@ def fetch_resources(
     conn = get_connection(db_path)
 
     if skills is None:
-        skills = get_missing_skills(conn)
+        skills = get_missing_skills(conn, telegram_user_id=telegram_user_id)
 
     if not skills:
         print("No missing skills found. Run analyzer.py first.")

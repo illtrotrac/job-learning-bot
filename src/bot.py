@@ -298,7 +298,9 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         from resources import fetch_resources
-        saved = await loop.run_in_executor(None, fetch_resources)
+        saved = await loop.run_in_executor(
+            None, lambda: fetch_resources(telegram_user_id=user_id)
+        )
 
         await update.message.reply_text(
             f"Pipeline complete.\n\n"

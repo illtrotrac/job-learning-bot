@@ -98,18 +98,52 @@ def _top_missing_skills(
     return ranked[:top_n]
 
 
-def _fresh_resources(conn: sqlite3.Connection, limit: int = 4) -> list[dict]:
-    """Learning resources are shared across users; prefer least-sent."""
-    rows = conn.execute(
-        """
-        SELECT * FROM learning_resources
-        WHERE expires_at IS NULL OR expires_at > datetime('now')
-        ORDER BY sent_count ASC, fetched_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+def _fresh_resources(
+    conn: sqlite3.Connection,
+    profile_ids: list[int],
+    limit: int = 4,
+) -> list[dict]:
+    """
+    Return resources for skills the user actually has gaps in.
+    Falls back to any fresh resource if no profile-specific ones exist.
+    """
+    # Collect the skills this user's active profile is missing
+    needed: set[str] = set()
+    if profile_ids:
+        placeholders = ",".join("?" * len(profile_ids))
+        rows = conn.execute(
+            f"SELECT missing_skills FROM skill_gaps "
+            f"WHERE missing_skills IS NOT NULL AND resume_profile_id IN ({placeholders})",
+            profile_ids,
+        ).fetchall()
+        for row in rows:
+            for skill in json.loads(row["missing_skills"] or "[]"):
+                needed.add(skill.strip())
+
+    if needed:
+        skill_ph = ",".join("?" * len(needed))
+        result = conn.execute(
+            f"""
+            SELECT * FROM learning_resources
+            WHERE (expires_at IS NULL OR expires_at > datetime('now'))
+              AND skill IN ({skill_ph})
+            ORDER BY sent_count ASC, fetched_at DESC
+            LIMIT ?
+            """,
+            (*needed, limit),
+        ).fetchall()
+    else:
+        result = conn.execute(
+            """
+            SELECT * FROM learning_resources
+            WHERE expires_at IS NULL OR expires_at > datetime('now')
+            ORDER BY sent_count ASC, fetched_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    return [dict(r) for r in result]
 
 
 def _already_sent_today(conn: sqlite3.Connection, telegram_user_id: str) -> bool:
@@ -251,7 +285,7 @@ def send_digest(
         "jobs": _top_job_matches(conn, profile_ids),
         "trends": _tech_trends(conn, profile_ids),
         "missing_skills": _top_missing_skills(conn, profile_ids),
-        "resources": _fresh_resources(conn),
+        "resources": _fresh_resources(conn, profile_ids),
     }
 
     if not data["jobs"] and not data["resources"]:
@@ -296,7 +330,7 @@ def preview_digest(
         "jobs": _top_job_matches(conn, profile_ids),
         "trends": _tech_trends(conn, profile_ids),
         "missing_skills": _top_missing_skills(conn, profile_ids),
-        "resources": _fresh_resources(conn),
+        "resources": _fresh_resources(conn, profile_ids),
     }
     conn.close()
     print(format_digest(data))
