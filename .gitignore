@@ -1,0 +1,17 @@
+# Secrets — never commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# The database is intentionally tracked so GitHub Actions can persist it.
+# Do NOT add src/data/job_learning.db here.
+
+# OS
+.DS_Store
+Thumbs.db

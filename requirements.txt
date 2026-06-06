@@ -1,0 +1,8 @@
+anthropic>=0.49.0
+pymupdf>=1.24.0
+python-dotenv>=1.0.0
+serpapi>=0.1.5
+tavily-python>=0.3.0
+python-telegram-bot>=21.0
+requests>=2.31.0
+schedule>=1.2.0
